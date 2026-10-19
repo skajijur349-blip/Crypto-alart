@@ -1,13 +1,11 @@
 """
 Angel Ruh signal bot (GitHub Actions only - no TradingView needed)
 
-Every 3 minutes (right after a 3m candle closes) it:
-  1. downloads Delta Exchange futures candles (ETHUSD, ZECUSD, NEARUSD)
-  2. looks for your rejection entry on the last CLOSED 3m, 4H and 1D candle:
-        long wick + volume condition + level tested before (+ higher-timeframe check for 4H/1D)
-  3. if there is a NEW BUY / SELL it sends a Telegram message plus charts for
-     3m, 15m, 30m, 1H, 4H, 1D with BUY / SELL labels (period high/low with hit count,
-     and entry markers), like the Angel Ruh indicator on TradingView.
+Simple logic, checked right after every 3m candle closes:
+  - closed candle makes a NEW DAY HIGH (IST day)  -> SELL signal
+  - closed candle makes a NEW DAY LOW  (IST day)  -> BUY signal
+No wick / volume / tested-level / higher-timeframe conditions.
+Sends a Telegram message plus charts for 3m, 15m, 30m, 1H, 4H, 1D.
 """
 import json
 import os
@@ -23,43 +21,36 @@ import pandas as pd
 import requests
 
 # =====================================================================
-# SETTINGS (change these if you want)
+# SETTINGS
 # =====================================================================
 TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 CHAT = os.environ.get("TG_CHAT_ID", "")
 BASE = os.environ.get("DELTA_BASE", "https://api.india.delta.exchange")
 TEST_MODE = os.environ.get("TEST_MODE", "").strip().lower() == "true"
-LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "0") or 0)   # >0 = keep checking inside one run
-CHECK_EVERY = 180                                               # seconds between checks (3 minutes)
+LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "0") or 0)
+CHECK_EVERY = 180                       # 3 minutes
 
-SYMBOLS = ["ETHUSD", "ZECUSD", "NEARUSD"]   # only these Delta futures are used
-SIGNAL_TFS = ["3m", "4h", "1d"]         # timeframes where the entry rule is checked
-HTF_OF = {"4h": "1d", "1d": "1w"}       # higher timeframe used for confirmation (3m has none)
+SYMBOLS = ["ETHUSD", "ZECUSD", "NEARUSD"]
+SIGNAL_TFS = ["3m"]                     # signal timeframe(s). 3m = day high/low, 4h = week, 1d = month
 CHART_TFS = ["3m", "15m", "30m", "1h", "4h", "1d"]
+
+SIDE_ON_HIGH = "SELL"                   # new period high -> SELL  (set "BUY" for breakout style)
+SIDE_ON_LOW = "BUY"                     # new period low  -> BUY   (set "SELL" for breakout style)
+MIN_BARS = 5                            # ignore the first N candles of a new day (no real high/low yet)
 
 TF_SEC = {"3m": 180, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800}
 FETCH_N = {"3m": 960, "15m": 480, "30m": 360, "1h": 300, "4h": 300, "1d": 420}
-SHOW_N = 100                            # candles drawn on each chart
+SHOW_N = 100
 
-# rejection rules (same meaning as the Pine script)
-LB = 50                 # level lookback (candles)
-LVL_TOL = 0.3           # % - what counts as "same price"
-MIN_TESTS = 1           # earlier touches of the level
-WICK_MIN = 0.55         # wick must be >= 55% of candle range
-MIN_RNG_ATR = 0.6       # ignore tiny candles (x ATR)
-VOL_MODE = "up"         # "up" (above average), "down" (below average) or "any"
-VOL_LEN = 20
-VOL_MULT = 1.2
 ATR_LEN = 14
-SL_BUF = 0.3            # stop buffer beyond the wick (x ATR)
+SL_BUF = 0.3            # stop buffer beyond the candle (x ATR)
 RR = 2.0                # take profit = risk x RR
-HTF_MODE = "rejection"  # "rejection" = higher TF also printed a rejection, "off" = ignore
-HTF_RECENT = 2          # ... within the last N higher-TF candles
-HTF_LB = 20
-HTF_TOL = 0.5
-PERIOD_TOL = 0.1        # % tolerance for the period high/low hit count
+PERIOD_TOL = 0.1        # % tolerance for the period high/low hit count on charts
 
-BG = "#fbfbc9"          # chart background (like your TradingView theme)
+GROUP_OF = {"3m": "D", "15m": "D", "30m": "D", "1h": "D", "4h": "W", "1d": "M"}
+GROUP_NAME = {"D": "DAY", "W": "WEEK", "M": "MONTH"}
+
+BG = "#fbfbc9"
 
 
 # =====================================================================
@@ -100,7 +91,7 @@ def fetch(sym, tf):
             df = df[~df.index.duplicated()]
             _cache[key] = df
             return df
-        except Exception as e:  # retry
+        except Exception as e:
             last_err = e
             time.sleep(2)
     raise last_err
@@ -134,111 +125,76 @@ def wma(s, n):
     return s.rolling(n).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
 
 
-def analyze(df, lb, tol, min_tests):
-    """Long-wick rejection at a tested level. Returns bull/bear flags per candle."""
-    o, h, l, c, v = (df[x] for x in ["Open", "High", "Low", "Close", "Volume"])
-    rng = h - l
-    safe = rng.replace(0, np.nan)
-    lo_pct = ((np.minimum(o, c) - l) / safe).fillna(0)
-    up_pct = ((h - np.maximum(o, c)) / safe).fillna(0)
-    atr = atr_series(df, ATR_LEN)
-    big = rng >= MIN_RNG_ATR * atr
-
-    vavg = v.rolling(VOL_LEN).mean()
-    if VOL_MODE == "any":
-        vol_ok = pd.Series(True, index=df.index)
-    elif VOL_MODE == "up":
-        vol_ok = v > vavg * VOL_MULT
-    else:
-        vol_ok = v < vavg
-    vol_ok = vol_ok | (v <= 0) | v.isna()          # no volume data -> ignore
-
-    bt = pd.Series(0, index=df.index)
-    st = pd.Series(0, index=df.index)
-    for k in range(1, lb + 1):
-        bt += ((l.shift(k) - l).abs() <= l * tol / 100).astype(int)
-        st += ((h.shift(k) - h).abs() <= h * tol / 100).astype(int)
-
-    low_prev = l.rolling(lb).min().shift(1)
-    high_prev = h.rolling(lb).max().shift(1)
-    at_sup = l <= low_prev * (1 + tol / 100)
-    at_res = h >= high_prev * (1 - tol / 100)
-
-    bull = big & (lo_pct >= WICK_MIN) & vol_ok & at_sup & (bt >= min_tests)
-    bear = big & (up_pct >= WICK_MIN) & vol_ok & at_res & (st >= min_tests)
-    return pd.DataFrame(
-        {"bull": bull.fillna(False).astype(bool), "bear": bear.fillna(False).astype(bool),
-         "bt": bt, "st": st, "atr": atr},
-        index=df.index,
-    )
+# =====================================================================
+# PERIOD KEYS (IST day / week / month)
+# =====================================================================
+def period_keys(index, group):
+    shifted = index + pd.Timedelta(hours=5, minutes=30)          # IST periods
+    if group == "W":
+        return np.asarray(shifted.to_period("W-SUN").astype(str))
+    if group == "M":
+        return np.asarray(shifted.to_period("M").astype(str))
+    return np.asarray(shifted.strftime("%Y-%m-%d"))
 
 
+# =====================================================================
+# SIGNALS: new day high / day low on a CLOSED candle
+# =====================================================================
 def find_signals(sym, tf):
-    """All entry signals on CLOSED candles of tf (history + latest)."""
     df = closed_part(fetch(sym, tf), tf)
-    if len(df) < LB + 5:
+    if len(df) < 30:
         return []
-    f = analyze(df, LB, LVL_TOL, MIN_TESTS)
-    ok_long = f["bull"].copy()
-    ok_short = f["bear"].copy()
+    group = GROUP_OF[tf]
+    keys = period_keys(df.index, group)
 
-    if HTF_MODE == "rejection" and tf in HTF_OF:
-        htf = HTF_OF[tf]
-        hdf = closed_part(fetch(sym, htf), htf)
-        if len(hdf) >= HTF_LB + 5:
-            hf = analyze(hdf, HTF_LB, HTF_TOL, MIN_TESTS)
-            hb = hf["bull"].astype(int).rolling(HTF_RECENT, min_periods=1).max().astype(bool).values
-            hs = hf["bear"].astype(int).rolling(HTF_RECENT, min_periods=1).max().astype(bool).values
-            h_close = (hdf.index + pd.Timedelta(seconds=TF_SEC[htf])).values
-            s_close = (df.index + pd.Timedelta(seconds=TF_SEC[tf])).values
-            pos = np.searchsorted(h_close, s_close, side="right") - 1
-            valid = pos >= 0
-            pc = np.clip(pos, 0, None)
-            ok_long = ok_long & pd.Series(np.where(valid, hb[pc], False), index=df.index)
-            ok_short = ok_short & pd.Series(np.where(valid, hs[pc], False), index=df.index)
-        else:
-            ok_long = ok_long & False
-            ok_short = ok_short & False
+    hi_cm = df["High"].groupby(keys).cummax()
+    lo_cm = df["Low"].groupby(keys).cummin()
+    prev_hi = hi_cm.groupby(keys).shift(1)          # highest high of the day BEFORE this candle
+    prev_lo = lo_cm.groupby(keys).shift(1)
+    bars = df["Close"].groupby(keys).cumcount()     # candle number inside the day
+
+    new_hi = (df["High"] > prev_hi) & (bars >= MIN_BARS)
+    new_lo = (df["Low"] < prev_lo) & (bars >= MIN_BARS)
+    both = new_hi & new_lo                          # same candle took both ends -> skip
+    new_hi = new_hi & ~both
+    new_lo = new_lo & ~both
+
+    atr = atr_series(df, ATR_LEN)
+    kind_name = GROUP_NAME[group]
 
     sigs = []
-    mask = (ok_long | ok_short).values
-    for i in np.where(mask)[0]:
-        ts = df.index[i]
-        side = "BUY" if ok_long.iloc[i] else "SELL"
+    for i in np.where((new_hi | new_lo).values)[0]:
+        is_high = bool(new_hi.iloc[i])
+        side = SIDE_ON_HIGH if is_high else SIDE_ON_LOW
+        level = float(df["High"].iloc[i]) if is_high else float(df["Low"].iloc[i])
         e = float(df["Close"].iloc[i])
-        atr = float(f["atr"].iloc[i])
+        a = float(atr.iloc[i])
         if side == "BUY":
-            sl = float(df["Low"].iloc[i]) - atr * SL_BUF
+            sl = float(df["Low"].iloc[i]) - a * SL_BUF
             risk = e - sl
             tp = e + risk * RR
-            tested = int(f["bt"].iloc[i])
         else:
-            sl = float(df["High"].iloc[i]) + atr * SL_BUF
+            sl = float(df["High"].iloc[i]) + a * SL_BUF
             risk = sl - e
             tp = e - risk * RR
-            tested = int(f["st"].iloc[i])
         if risk <= 0:
             continue
+        ts = df.index[i]
         sigs.append(dict(
             sym=sym, tf=tf, side=side, ts=ts,
             close_ts=ts + pd.Timedelta(seconds=TF_SEC[tf]),
-            entry=e, sl=sl, tp=tp, tested=tested,
+            entry=e, sl=sl, tp=tp, level=level,
+            kind=f"{kind_name} {'HIGH' if is_high else 'LOW'}",
             last=(i == len(df) - 1), current=False,
         ))
     return sigs
 
 
 # =====================================================================
-# ANGEL RUH PERIOD HIGH / LOW MARKERS (same idea as the Pine indicator)
+# PERIOD HIGH / LOW MARKERS (chart labels)
 # =====================================================================
 def period_markers(df, group):
-    shifted = df.index + pd.Timedelta(hours=5, minutes=30)          # IST periods
-    if group == "W":
-        keys = np.asarray(shifted.to_period("W-SUN").astype(str))
-    elif group == "M":
-        keys = np.asarray(shifted.to_period("M").astype(str))
-    else:
-        keys = np.asarray(shifted.strftime("%Y-%m-%d"))
+    keys = period_keys(df.index, group)
     order = list(dict.fromkeys(keys))
     out = []
     for name in order[1:-1]:                  # skip first (partial) and last (still forming)
@@ -256,9 +212,6 @@ def period_markers(df, group):
 # =====================================================================
 # CHART
 # =====================================================================
-GROUP_OF = {"3m": "D", "15m": "D", "30m": "D", "1h": "D", "4h": "W", "1d": "M"}
-
-
 def fmt(p):
     if p >= 100:
         return f"{p:.2f}"
@@ -288,14 +241,12 @@ def make_chart(df, tf, sym, sigs, path):
 
     last_close = float(dfp["Close"].iloc[-1])
     hl_vals, hl_cols = [last_close], ["#2962ff"]
-    # latest closed period high / low lines (black)
     for side in ("SELL", "BUY"):
         ms = [m for m in marks if m[3] == side]
         if ms:
             hl_vals.append(ms[-1][1])
             hl_cols.append("#222222")
 
-    # entry markers that fall inside this chart
     entries = []
     cur = None
     for s in sigs:
@@ -327,7 +278,6 @@ def make_chart(df, tf, sym, sigs, path):
     )
     ax = axes[0]
 
-    # period high/low labels (like the Angel Ruh indicator)
     for (x, price, hits, side) in marks:
         col = "#ef5350" if side == "SELL" else "#43a047"
         up = side == "SELL"
@@ -340,7 +290,6 @@ def make_chart(df, tf, sym, sigs, path):
         )
         ax.plot([x], [price], marker="v" if up else "^", color=col, markersize=5, zorder=10)
 
-    # entry signals (BUY / SELL) on this chart
     for (x, s) in entries:
         buy = s["side"] == "BUY"
         col = "#00c853" if buy else "#d500f9"
@@ -360,7 +309,6 @@ def make_chart(df, tf, sym, sigs, path):
             arrowprops=dict(arrowstyle="-|>", color=col, lw=1.5 if is_cur else 1.0), zorder=11 if is_cur else 9,
         )
 
-    # current price tag
     ax.annotate(fmt(last_close), xy=(show - 1, last_close), xytext=(8, 0),
                 textcoords="offset points", va="center", fontsize=7, color="white",
                 bbox=dict(boxstyle="square,pad=0.25", fc="#2962ff", ec="none"), zorder=12)
@@ -416,13 +364,11 @@ def signal_text(s):
     lines = [
         f"{emoji} {s['side']} SIGNAL",
         f"{s['sym']} (Delta Futures) | Signal TF: {s['tf'].upper()}",
+        f"New {s['kind']}: {fmt(s['level'])}",
         f"Entry ~ {fmt(s['entry'])}",
         f"SL: {fmt(s['sl'])}",
         f"TP: {fmt(s['tp'])}  (RR 1:{RR:g})",
-        f"Level tested: {s['tested']}x",
     ]
-    if HTF_MODE == "rejection" and s["tf"] in HTF_OF:
-        lines.append(f"Higher TF ({HTF_OF[s['tf']].upper()}) rejection confirmed")
     return "\n".join(lines)
 
 
@@ -451,7 +397,6 @@ def sig_key(s):
 # MAIN
 # =====================================================================
 def commit_state():
-    """Save state.json to the repository right away (so a restart never repeats a signal)."""
     if not os.environ.get("GITHUB_ACTIONS"):
         return
     try:
@@ -465,7 +410,7 @@ def commit_state():
 
 
 def run_once():
-    _cache.clear()                                  # always use fresh candles
+    _cache.clear()
     state = load_state()
     sent = list(state.get("sent", []))
     changed = False
@@ -506,7 +451,7 @@ def main():
     deadline = time.time() + LOOP_MINUTES * 60
     while True:
         now = time.time()
-        nxt = (now // CHECK_EVERY + 1) * CHECK_EVERY + 5   # next 3m close + 5s for the exchange to publish it
+        nxt = (now // CHECK_EVERY + 1) * CHECK_EVERY + 5   # next 3m close + 5s
         if nxt >= deadline:
             break
         time.sleep(max(0, nxt - now))
