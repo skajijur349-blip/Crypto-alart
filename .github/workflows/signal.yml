@@ -2,7 +2,7 @@ name: Signal Charts
 
 on:
   schedule:
-    - cron: "0 * * * *"
+    - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       test:
@@ -19,7 +19,7 @@ concurrency:
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,4 +32,4 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TEST_MODE: ${{ github.event.inputs.test }}
-          LOOP_MINUTES: ${{ (github.event_name == 'schedule' || github.event.inputs.test == 'false') && '56' || '0' }}
+          LOOP_MINUTES: ${{ (github.event_name == 'schedule' || github.event.inputs.test == 'false') && '340' || '0' }}
