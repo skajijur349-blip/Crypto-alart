@@ -1,13 +1,18 @@
 name: Signal Charts
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/signal.yml"
+      - "signal_charts.py"
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
     inputs:
       test:
-        description: "true = send test charts once.  false = start the live 3-minute checker now"
-        default: "true"
+        description: "false = live 3-minute checker (default).  true = send test charts once and stop"
+        default: "false"
 
 permissions:
   contents: write
@@ -31,5 +36,5 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TEST_MODE: ${{ github.event.inputs.test }}
-          LOOP_MINUTES: ${{ (github.event_name == 'schedule' || github.event.inputs.test == 'false') && '340' || '0' }}
+          TEST_MODE: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true') && 'true' || 'false' }}
+          LOOP_MINUTES: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.test == 'true') && '0' || '340' }}
