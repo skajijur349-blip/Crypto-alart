@@ -8,6 +8,7 @@ Photo  : one plain 1H candle chart (about 5 days) with horizontal support / resi
          lines at price levels that were rejected several times. No arrows, no labels.
 Text   : New High / Target previous high / Stop loss current low
          (New Low / Target previous low / Stop loss current high)
+Also sends the same plain 1H chart for every coin once an hour, 2 minutes before the 1H candle closes.
 """
 import json
 import os
@@ -39,6 +40,9 @@ CHART_TF = "1h"
 MIN_BARS = 30           # ignore the first N minutes after midnight IST (no real day high/low yet)
 COOLDOWN_MIN = 0        # minutes to wait before another signal of the same coin + same side (0 = off)
 HEARTBEAT_MIN = 60      # "bot alive" message every N minutes (0 = off)
+HOURLY_CHART = True     # send a 1H chart photo for every coin once an hour
+HOURLY_CHART_MIN = 58   # minute past the hour in UTC: 58 = 2 min before the 1H candle closes (= :28 IST)
+                        # use 28 instead to send 2 min before the full hour on the IST clock (= :58 IST)
 
 TF_SEC = {"1m": 60, "1h": 3600}
 FETCH_N = {"1m": 1500, "1h": 300}
@@ -324,6 +328,15 @@ def run_once():
         commit_state()
 
 
+def send_hourly_charts():
+    _cache.clear()
+    for sym in SYMBOLS:
+        try:
+            send_photo(sym, f"{sym} 1H")
+        except Exception as e:
+            print(f"hourly chart failed for {sym}: {e}", flush=True)
+
+
 def main():
     print(f"START test={TEST_MODE} loop={LOOP_MINUTES} "
           f"token={'set' if TOKEN else 'MISSING'} chat={'set' if CHAT else 'MISSING'}", flush=True)
@@ -333,6 +346,7 @@ def main():
     tg("sendMessage", data={"chat_id": CHAT, "text": "✅ Live 1m checker started"})
     deadline = time.time() + max(LOOP_MINUTES, 1) * 60
     last_hb = time.time()
+    last_chart_hour = None
     while True:
         now = time.time()
         nxt = (now // CHECK_EVERY + 1) * CHECK_EVERY + 5      # next 1m close + 5s
@@ -343,6 +357,11 @@ def main():
             run_once()
         except Exception as e:
             print("cycle failed:", e, flush=True)
+        minute_idx = int(time.time() // 60)
+        hour_idx = minute_idx // 60
+        if HOURLY_CHART and minute_idx % 60 == HOURLY_CHART_MIN and hour_idx != last_chart_hour:
+            last_chart_hour = hour_idx
+            send_hourly_charts()
         if HEARTBEAT_MIN and time.time() - last_hb >= HEARTBEAT_MIN * 60:
             tg("sendMessage", data={"chat_id": CHAT, "text": "💓 Bot alive"})
             last_hb = time.time()
