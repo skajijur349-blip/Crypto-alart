@@ -1,4 +1,6 @@
+six
 requests
 pandas
+numpy
 matplotlib
 mplfinance
