@@ -1,9 +1,11 @@
 """
 Day high / day low alert bot (GitHub Actions only)
 
-Checked right after every 1-minute candle closes:
-  - closed 1m candle makes a NEW DAY HIGH (IST day) -> photo + text
-  - closed 1m candle makes a NEW DAY LOW  (IST day) -> photo + text
+Checked every 30 seconds (at :00 and :30 of each minute):
+  - a 30-second window makes a NEW DAY HIGH (IST day) -> photo + text
+  - a 30-second window makes a NEW DAY LOW  (IST day) -> photo + text
+  (Delta has no 30s candles, so they are built from the 1m candle: at :30 the
+   forming 1m candle = first 30s; at :00 the closed 1m candle shows the last 30s.)
 Photo  : one plain 1H candle chart (about 5 days) with horizontal support / resistance
          lines at price levels that were rejected several times. No arrows, no labels.
 Text   : New High / Target previous high / Stop loss current low
@@ -31,7 +33,7 @@ CHAT = os.environ.get("TG_CHAT_ID", "")
 BASE = os.environ.get("DELTA_BASE", "https://api.india.delta.exchange")
 TEST_MODE = os.environ.get("TEST_MODE", "").strip().lower() == "true"
 LOOP_MINUTES = float(os.environ.get("LOOP_MINUTES", "0") or 0)
-CHECK_EVERY = 60                        # check once per 1m candle close
+CHECK_EVERY = 30                        # check at every 30-second candle close
 
 SYMBOLS = ["ETHUSD", "ZECUSD", "NEARUSD"]
 SIGNAL_TF = "1m"
@@ -113,34 +115,58 @@ def day_keys(index):
     return np.asarray((index + pd.Timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d"))
 
 
-def find_signals(sym):
-    df = closed_part(fetch(sym, SIGNAL_TF), SIGNAL_TF)
-    if len(df) < 60:
-        return [], None
-    keys = day_keys(df.index)
+_snap = {}      # first-half (0-30s) high / low of each 1m candle, saved at :30
 
-    hi_cm = df["High"].groupby(keys).cummax()
-    lo_cm = df["Low"].groupby(keys).cummin()
-    prev_hi = hi_cm.groupby(keys).shift(1)          # day high BEFORE this candle
-    prev_lo = lo_cm.groupby(keys).shift(1)          # day low BEFORE this candle
-    bars = df["Close"].groupby(keys).cumcount()     # candle number inside the day
 
-    i = len(df) - 1                                 # only the last closed candle matters
-    row = df.iloc[i]
-    ok_bars = bool(bars.iloc[i] >= MIN_BARS)
-    new_hi = ok_bars and bool(row["High"] > prev_hi.iloc[i])
-    new_lo = ok_bars and bool(row["Low"] < prev_lo.iloc[i])
-    last_ts = df.index[i]
-    if new_hi == new_lo:                            # nothing, or one candle took both ends
-        return [], last_ts
-
-    if new_hi:
-        s = dict(sym=sym, ts=last_ts, kind="HIGH", level=float(row["High"]),
-                 prev=float(prev_hi.iloc[i]), stop=float(row["Low"]))
+def find_signals(sym, phase):
+    """30-second candle logic built from 1m candles.
+    phase 'half': at :30 the forming 1m candle holds the first 30 seconds.
+    phase 'full': at :00 the closed 1m candle; whatever the first half already showed is excluded,
+                  so only a new extreme made in the last 30 seconds counts."""
+    raw = fetch(sym, SIGNAL_TF)
+    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
+    if phase == "half":
+        ts = now.floor("min")
+        if raw.index[-1] != ts:
+            return [], None                         # exchange did not return the forming candle
+        base = raw.iloc[:-1]
+        row = raw.iloc[-1]
     else:
-        s = dict(sym=sym, ts=last_ts, kind="LOW", level=float(row["Low"]),
-                 prev=float(prev_lo.iloc[i]), stop=float(row["High"]))
-    return [s], last_ts
+        closed = closed_part(raw, SIGNAL_TF)
+        if len(closed) < 60:
+            return [], None
+        base = closed.iloc[:-1]
+        row = closed.iloc[-1]
+        ts = closed.index[-1]
+    if (now - ts).total_seconds() > 150:
+        return [], ts                               # stale data, skip
+
+    day = (ts + pd.Timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    b = base[day_keys(base.index) == day]           # candles of the same IST day before this minute
+    if len(b) < MIN_BARS:
+        return [], ts
+    ref_hi = float(b["High"].max())
+    ref_lo = float(b["Low"].min())
+    hi, lo = float(row["High"]), float(row["Low"])
+
+    if phase == "half":
+        _snap[(sym, ts)] = (hi, lo)
+    else:
+        first = _snap.get((sym, ts))
+        if first:
+            ref_hi = max(ref_hi, first[0])
+            ref_lo = min(ref_lo, first[1])
+
+    new_hi = hi > ref_hi
+    new_lo = lo < ref_lo
+    if new_hi == new_lo:                            # nothing, or both ends taken together -> skip
+        return [], ts
+    tag = "A" if phase == "half" else "B"
+    if new_hi:
+        s = dict(sym=sym, ts=ts, tag=tag, kind="HIGH", level=hi, prev=ref_hi, stop=lo)
+    else:
+        s = dict(sym=sym, ts=ts, tag=tag, kind="LOW", level=lo, prev=ref_lo, stop=hi)
+    return [s], ts
 
 
 def signal_text(s):
@@ -272,7 +298,7 @@ def save_state(state):
 
 
 def sig_key(s):
-    return f"{s['sym']}|{SIGNAL_TF}|{s['ts'].isoformat()}|{s['kind']}"
+    return f"{s['sym']}|30s|{s['ts'].isoformat()}|{s['tag']}|{s['kind']}"
 
 
 def commit_state():
@@ -291,8 +317,11 @@ def commit_state():
 # =====================================================================
 # MAIN
 # =====================================================================
-def run_once():
+def run_once(phase="full"):
     _cache.clear()
+    cutoff = pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timedelta(minutes=10)
+    for k in [k for k in _snap if k[1] < cutoff]:
+        del _snap[k]
     state = load_state()
     sent = list(state["sent"])
     last_sent = state["last_sent"]
@@ -303,11 +332,11 @@ def run_once():
             send_photo(sym, f"🧪 TEST {sym}\n1H chart + support / resistance lines")
             continue
         try:
-            sigs, last_ts = find_signals(sym)
+            sigs, last_ts = find_signals(sym, phase)
         except Exception as e:
             print(f"{sym}: could not analyse ({e})", flush=True)
             continue
-        print(f"{time.strftime('%H:%M:%S')} {sym}: last closed 1m {last_ts} -> "
+        print(f"{time.strftime('%H:%M:%S')} {sym} [{phase}] 1m candle {last_ts} -> "
               f"{sigs[0]['kind'] if sigs else 'no signal'}", flush=True)
 
         for s in sigs:
@@ -343,18 +372,19 @@ def main():
     if TEST_MODE:
         run_once()
         return
-    tg("sendMessage", data={"chat_id": CHAT, "text": "✅ Live 1m checker started"})
+    tg("sendMessage", data={"chat_id": CHAT, "text": "✅ Live 30s checker started"})
     deadline = time.time() + max(LOOP_MINUTES, 1) * 60
     last_hb = time.time()
     last_chart_hour = None
     while True:
         now = time.time()
-        nxt = (now // CHECK_EVERY + 1) * CHECK_EVERY + 5      # next 1m close + 5s
+        nxt = (now // CHECK_EVERY + 1) * CHECK_EVERY + 3      # next :00 or :30 + 3s
         if nxt >= deadline:
             break
         time.sleep(max(0, nxt - now))
+        phase = "full" if time.time() % 60 < 30 else "half"      # :03 = minute just closed, :33 = first 30s
         try:
-            run_once()
+            run_once(phase)
         except Exception as e:
             print("cycle failed:", e, flush=True)
         minute_idx = int(time.time() // 60)
